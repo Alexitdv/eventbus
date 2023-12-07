@@ -6,7 +6,7 @@ import (
 	"sync"
 )
 
-//BusSubscriber defines subscription-related bus behavior
+// BusSubscriber defines subscription-related bus behavior
 type BusSubscriber interface {
 	Subscribe(topic string, fn interface{}) error
 	SubscribeAsync(topic string, fn interface{}, transactional bool) error
@@ -15,18 +15,19 @@ type BusSubscriber interface {
 	Unsubscribe(topic string, handler interface{}) error
 }
 
-//BusPublisher defines publishing-related bus behavior
+// BusPublisher defines publishing-related bus behavior
 type BusPublisher interface {
 	Publish(topic string, args ...interface{})
 }
 
-//BusController defines bus control behavior (checking handler's presence, synchronization)
+// BusController defines bus control behavior (checking handler's presence, synchronization)
 type BusController interface {
 	HasCallback(topic string) bool
 	WaitAsync()
+	WaitTopicAsync(topic string)
 }
 
-//Bus englobes global (subscribe, publish, control) bus behavior
+// Bus englobes global (subscribe, publish, control) bus behavior
 type Bus interface {
 	BusController
 	BusSubscriber
@@ -35,9 +36,10 @@ type Bus interface {
 
 // EventBus - box for handlers and callbacks.
 type EventBus struct {
-	handlers map[string][]*eventHandler
-	lock     sync.Mutex // a lock for the map
-	wg       sync.WaitGroup
+	handlers    map[string][]*eventHandler
+	lock        sync.RWMutex // a lock for the map
+	wg          sync.WaitGroup
+	topicsAwait map[string]*sync.WaitGroup
 }
 
 type eventHandler struct {
@@ -52,8 +54,9 @@ type eventHandler struct {
 func New() Bus {
 	b := &EventBus{
 		make(map[string][]*eventHandler),
-		sync.Mutex{},
+		sync.RWMutex{},
 		sync.WaitGroup{},
+		make(map[string]*sync.WaitGroup),
 	}
 	return Bus(b)
 }
@@ -149,7 +152,13 @@ func (bus *EventBus) Publish(topic string, args ...interface{}) {
 					handler.Lock()
 					bus.lock.Lock()
 				}
-				go bus.doPublishAsync(handler, topic, args...)
+				group, has := bus.topicsAwait[topic] // BUG if not made
+				if !has {
+					group = &sync.WaitGroup{}
+					bus.topicsAwait[topic] = group
+				}
+				group.Add(1)
+				go bus.doPublishAsync(handler, topic, group, args...)
 			}
 		}
 	}
@@ -160,8 +169,9 @@ func (bus *EventBus) doPublish(handler *eventHandler, topic string, args ...inte
 	handler.callBack.Call(passedArguments)
 }
 
-func (bus *EventBus) doPublishAsync(handler *eventHandler, topic string, args ...interface{}) {
+func (bus *EventBus) doPublishAsync(handler *eventHandler, topic string, wg *sync.WaitGroup, args ...interface{}) {
 	defer bus.wg.Done()
+	defer wg.Done()
 	if handler.transactional {
 		defer handler.Unlock()
 	}
@@ -212,4 +222,18 @@ func (bus *EventBus) setUpPublish(callback *eventHandler, args ...interface{}) [
 // WaitAsync waits for all async callbacks to complete
 func (bus *EventBus) WaitAsync() {
 	bus.wg.Wait()
+}
+
+// WaitAsync waits for all async callbacks by topic to complete
+func (bus *EventBus) WaitTopicAsync(topic string) {
+	var (
+		wg *sync.WaitGroup
+		ok bool
+	)
+	bus.lock.RLock()
+	wg, ok = bus.topicsAwait[topic]
+	bus.lock.RUnlock()
+	if ok {
+		wg.Wait()
+	}
 }
